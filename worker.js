@@ -70,44 +70,24 @@ async function processVideo(jobId, url, options, jobs) {
 async function downloadVideo(url, workDir) {
   const outputPath = path.join(workDir, 'source.mp4');
 
-  // Use cobalt.tools API to get a direct download URL (bypasses YouTube bot detection)
-  const cobaltRes = await axios.post('https://api.cobalt.tools/', {
-    url,
-    videoQuality: '1080',
-    filenameStyle: 'basic',
-  }, {
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-    },
-    timeout: 30_000,
-  });
-
-  const { status, url: downloadUrl, stream } = cobaltRes.data;
-
-  if (status === 'error') {
-    throw new Error(`Cobalt error: ${cobaltRes.data?.error?.code || 'unknown'}`);
+  // Write cookies to temp file
+  const cookiesPath = path.join(workDir, 'cookies.txt');
+  if (process.env.YOUTUBE_COOKIES) {
+    fs.writeFileSync(cookiesPath, process.env.YOUTUBE_COOKIES);
   }
 
-  // 'redirect' = direct URL, 'stream' = cobalt-proxied stream
-  const finalUrl = downloadUrl || stream;
-  if (!finalUrl) throw new Error('Cobalt returned no download URL');
+  const cmd = [
+    'yt-dlp',
+    '--format', '"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"',
+    '--merge-output-format', 'mp4',
+    '--max-filesize', '500m',
+    '--no-playlist',
+    process.env.YOUTUBE_COOKIES ? `--cookies "${cookiesPath}"` : '',
+    '--output', `"${outputPath}"`,
+    `"${url}"`,
+  ].filter(Boolean).join(' ');
 
-  console.log(`[cobalt] Downloading from: ${finalUrl}`);
-
-  // Stream download to disk
-  const writer = fs.createWriteStream(outputPath);
-  const response = await axios.get(finalUrl, {
-    responseType: 'stream',
-    timeout: 300_000,
-    maxContentLength: 500 * 1024 * 1024, // 500MB
-  });
-
-  await new Promise((resolve, reject) => {
-    response.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
+  await execAsync(cmd, { timeout: 300_000 });
 
   if (!fs.existsSync(outputPath)) {
     throw new Error('Download failed: output file not found');
