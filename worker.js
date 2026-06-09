@@ -294,18 +294,15 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
 
       // Caption style for bottom half
       const captionStyle = `Fontname=Arial,Fontsize=16,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2,MarginV=20`;
+      const safeSrtSplit = `/tmp/s${i}.srt`;
+      fs.copyFileSync(srtPath, safeSrtSplit);
 
       vf = [
-        // Split input into two streams
         `[0:v]split=2[gameplay_in][face_in]`,
-        // Gameplay: scale full frame to top half (1080x960)
         `[gameplay_in]${gameplayCrop}[gameplay]`,
-        // Face cam: crop and scale to bottom half (1080x960)  
         `[face_in]${faceCrop}[facecam]`,
-        // Stack: gameplay on top, face cam on bottom
-        `[gameplay][facecam]vstack=inputs=2[stacked]`,
-        // Add captions to the stacked output
-        `[stacked]subtitles='${srtPath}':force_style='${captionStyle}'[out]`,
+        `[facecam][gameplay]vstack=inputs=2[stacked]`,
+        `[stacked]subtitles='${safeSrtSplit}':force_style='${captionStyle}'[out]`,
       ].join(';');
 
       await execAsync(
@@ -324,7 +321,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
       await execAsync(
         `ffmpeg -i "${videoPath}" \
           -ss ${clip.start} -to ${clip.end} \
-          -vf "crop=ih*9/16:ih,scale=1080:1920,subtitles='${srtPath}':force_style='Fontname=Arial,Fontsize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2'" \
+          -vf "crop=ih*9/16:ih,scale=1080:1920,subtitles='${srtPath.replace(/:/g, '\\:').replace(/'/g, "\\'")}':force_style='Fontname=Arial,Fontsize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2'" \
           -c:v libx264 -preset fast -crf 23 \
           -c:a aac -b:a 128k \
           -movflags +faststart \
