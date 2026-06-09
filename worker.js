@@ -30,6 +30,7 @@ const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
 async function processVideo(jobId, url, options, jobs) {
+  // faceCamBox: { x, y, w, h, video_w, video_h } — set by user in UI
   const setStatus = (status, extra = {}) => {
     const job = jobs.get(jobId);
     Object.assign(job, { status, ...extra });
@@ -50,7 +51,7 @@ async function processVideo(jobId, url, options, jobs) {
     const clipWindows = await scoreAndPickClips(transcript, options);
 
     setStatus('running', { step: 'cutting' });
-    const clips = await cutAndCaptionClips(videoPath, clipWindows, workDir, transcript);
+    const clips = await cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, options.faceCamBox || null);
 
     setStatus('running', { step: 'uploading' });
     const uploadedClips = await uploadClipsToR2(clips, jobId);
@@ -193,9 +194,10 @@ Respond ONLY with valid JSON in this exact format:
   return parsed.clips.sort((a, b) => b.score - a.score).slice(0, maxClips);
 }
 
-// ─── Step 4: Detect face cam rectangle ──────────────────────────────────────
+// ─── Step 4: Cut + caption (with optional face cam split) ───────────────────
 
-async function detectFaceCam(videoPath) {
+// Legacy Vision detection — replaced by manual box selection in UI
+async function detectFaceCam_DISABLED(videoPath) {
   // Extract first frame
   const framePath = videoPath.replace('.mp4', '_frame.jpg');
   await execAsync(
@@ -260,16 +262,15 @@ No explanation, just the JSON.`
 
 // ─── Step 4: Cut + caption ────────────────────────────────────────────────────
 
-async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
+async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, faceCamBox) {
   const results = [];
 
-  // Detect face cam once for all clips
-  console.log('[facecam] Detecting face cam position...');
-  const faceCam = await detectFaceCam(videoPath);
+  // Use manually selected face cam box from UI, or fall back to simple crop
+  const faceCam = (faceCamBox && faceCamBox.w > 0 && faceCamBox.h > 0) ? faceCamBox : null;
   if (faceCam) {
-    console.log('[facecam] Detected:', JSON.stringify(faceCam));
+    console.log('[facecam] Using manual box:', JSON.stringify(faceCam));
   } else {
-    console.log('[facecam] Using center crop fallback');
+    console.log('[facecam] No face cam box — using center crop');
   }
 
   for (let i = 0; i < clipWindows.length; i++) {
