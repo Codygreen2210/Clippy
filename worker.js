@@ -192,10 +192,84 @@ Respond ONLY with valid JSON in this exact format:
   return parsed.clips.sort((a, b) => b.score - a.score).slice(0, maxClips);
 }
 
+// ─── Step 4: Detect face cam rectangle ──────────────────────────────────────
+
+async function detectFaceCam(videoPath) {
+  // Extract first frame
+  const framePath = videoPath.replace('.mp4', '_frame.jpg');
+  await execAsync(
+    `ffmpeg -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
+  );
+
+  const imageBuffer = fs.readFileSync(framePath);
+  const base64Image = imageBuffer.toString('base64');
+  fs.unlinkSync(framePath);
+
+  // Ask Claude Vision to detect the face cam
+  const response = await axios.post(
+    'https://api.anthropic.com/v1/messages',
+    {
+      model: 'claude-opus-4-5',
+      max_tokens: 256,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/jpeg', data: base64Image }
+          },
+          {
+            type: 'text',
+            text: `This is a frame from a gaming livestream. There is a face cam (webcam of the streamer) overlaid on the gameplay footage.
+
+Identify the face cam rectangle and return ONLY a JSON object with these fields:
+{
+  "x": <left edge in pixels>,
+  "y": <top edge in pixels>,
+  "w": <width in pixels>,
+  "h": <height in pixels>,
+  "video_w": <total video width in pixels>,
+  "video_h": <total video height in pixels>
+}
+
+No explanation, just the JSON.`
+          }
+        ]
+      }]
+    },
+    {
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      timeout: 30_000,
+    }
+  );
+
+  try {
+    const text = response.data.content[0].text.trim();
+    const clean = text.replace(/```json|```/g, '').trim();
+    return JSON.parse(clean);
+  } catch {
+    console.log('[facecam] Detection failed, using default layout');
+    return null;
+  }
+}
+
 // ─── Step 4: Cut + caption ────────────────────────────────────────────────────
 
 async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
   const results = [];
+
+  // Detect face cam once for all clips
+  console.log('[facecam] Detecting face cam position...');
+  const faceCam = await detectFaceCam(videoPath);
+  if (faceCam) {
+    console.log('[facecam] Detected:', JSON.stringify(faceCam));
+  } else {
+    console.log('[facecam] Using center crop fallback');
+  }
 
   for (let i = 0; i < clipWindows.length; i++) {
     const clip = clipWindows[i];
@@ -205,16 +279,58 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
     const srt = buildSRT(transcript.segments, clip.start, clip.end);
     fs.writeFileSync(srtPath, srt);
 
-    await execAsync(
-      `ffmpeg -i "${videoPath}" \
-        -ss ${clip.start} -to ${clip.end} \
-        -vf "crop=ih*9/16:ih,scale=1080:1920,subtitles='${srtPath}':force_style='Fontname=Arial,Fontsize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2'" \
-        -c:v libx264 -preset fast -crf 23 \
-        -c:a aac -b:a 128k \
-        -movflags +faststart \
-        "${outputPath}" -y`,
-      { timeout: 180_000 }
-    );
+    let vf;
+
+    if (faceCam) {
+      const { x, y, w, h, video_w, video_h } = faceCam;
+
+      // Face cam: crop to detected rectangle, scale to 1080x960
+      const faceCrop = `crop=${w}:${h}:${x}:${y},scale=1080:960`;
+
+      // Gameplay: use everything outside face cam — crop center of gameplay area
+      // Take the full frame, scale to 1080x960, use as background
+      const gameplayCrop = `scale=1080:960`;
+
+      // Caption style for bottom half
+      const captionStyle = `Fontname=Arial,Fontsize=16,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2,MarginV=20`;
+
+      vf = [
+        // Split input into two streams
+        `[0:v]split=2[gameplay_in][face_in]`,
+        // Gameplay: scale full frame to top half (1080x960)
+        `[gameplay_in]${gameplayCrop}[gameplay]`,
+        // Face cam: crop and scale to bottom half (1080x960)  
+        `[face_in]${faceCrop}[facecam]`,
+        // Stack: gameplay on top, face cam on bottom
+        `[gameplay][facecam]vstack=inputs=2[stacked]`,
+        // Add captions to the stacked output
+        `[stacked]subtitles='${srtPath}':force_style='${captionStyle}'[out]`,
+      ].join(';');
+
+      await execAsync(
+        `ffmpeg -i "${videoPath}" \
+          -ss ${clip.start} -to ${clip.end} \
+          -filter_complex "${vf}" \
+          -map "[out]" \
+          -c:v libx264 -preset fast -crf 23 \
+          -c:a aac -b:a 128k \
+          -movflags +faststart \
+          "${outputPath}" -y`,
+        { timeout: 180_000 }
+      );
+    } else {
+      // Fallback: simple center crop to 9:16
+      await execAsync(
+        `ffmpeg -i "${videoPath}" \
+          -ss ${clip.start} -to ${clip.end} \
+          -vf "crop=ih*9/16:ih,scale=1080:1920,subtitles='${srtPath}':force_style='Fontname=Arial,Fontsize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2'" \
+          -c:v libx264 -preset fast -crf 23 \
+          -c:a aac -b:a 128k \
+          -movflags +faststart \
+          "${outputPath}" -y`,
+        { timeout: 180_000 }
+      );
+    }
 
     results.push({
       index: i + 1,
