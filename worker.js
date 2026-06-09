@@ -282,7 +282,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
 
     let vf;
 
-    if (faceCam) {
+    if (faceCam && faceCam.w > 0 && faceCam.h > 0 && faceCam.x >= 0 && faceCam.y >= 0) {
       const { x, y, w, h, video_w, video_h } = faceCam;
 
       // Face cam: crop to detected rectangle, scale to 1080x960
