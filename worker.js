@@ -11,7 +11,7 @@ const execAsync = promisify(exec);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const TMP = '/tmp/clips';
-const MAX_VIDEO_DURATION_SECONDS = 3600; // 1 hour cap
+const MAX_VIDEO_DURATION_SECONDS = 3600;
 
 // ─── R2 client ────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ const r2 = new S3Client({
 });
 
 const R2_BUCKET = process.env.R2_BUCKET_NAME;
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL; // e.g. https://clips.yourdomain.com
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
@@ -40,27 +40,21 @@ async function processVideo(jobId, url, options, jobs) {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // 1. Download
     setStatus('running', { step: 'downloading' });
     const videoPath = await downloadVideo(url, workDir);
 
-    // 2. Transcribe
     setStatus('running', { step: 'transcribing' });
     const transcript = await transcribeVideo(videoPath);
 
-    // 3. Score + pick clips
     setStatus('running', { step: 'scoring' });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
-    // 4. Cut + caption each clip
     setStatus('running', { step: 'cutting' });
     const clips = await cutAndCaptionClips(videoPath, clipWindows, workDir, transcript);
 
-    // 5. Upload to R2
     setStatus('running', { step: 'uploading' });
     const uploadedClips = await uploadClipsToR2(clips, jobId);
 
-    // 6. Cleanup local files
     cleanupJob(jobId);
 
     setStatus('done', { clips: uploadedClips, step: 'done' });
@@ -68,8 +62,6 @@ async function processVideo(jobId, url, options, jobs) {
     setStatus('failed', { error: err.message, step: 'error' });
     throw err;
   }
-  // Note: workDir cleanup is intentionally deferred so files can be served/uploaded
-  // Call cleanupJob(jobId) from your server after the client downloads
 }
 
 // ─── Step 1: Download ─────────────────────────────────────────────────────────
@@ -77,24 +69,25 @@ async function processVideo(jobId, url, options, jobs) {
 async function downloadVideo(url, workDir) {
   const outputPath = path.join(workDir, 'source.mp4');
 
-  // yt-dlp: best mp4 under 1080p, merge video+audio
   const cmd = [
     'yt-dlp',
     '--format', '"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"',
     '--merge-output-format', 'mp4',
     '--max-filesize', '500m',
     '--no-playlist',
+    '--extractor-args', '"youtube:player_client=web,web_creator"',
+    '--user-agent', '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"',
+    '--add-header', '"Accept-Language:en-US,en;q=0.9"',
     '--output', `"${outputPath}"`,
     `"${url}"`,
   ].join(' ');
 
-  await execAsync(cmd, { timeout: 300_000 }); // 5 min max
+  await execAsync(cmd, { timeout: 300_000 });
 
   if (!fs.existsSync(outputPath)) {
     throw new Error('Download failed: output file not found');
   }
 
-  // Check duration
   const duration = getVideoDuration(outputPath);
   if (duration > MAX_VIDEO_DURATION_SECONDS) {
     throw new Error(`Video too long: ${Math.round(duration / 60)} minutes (max 60)`);
@@ -113,7 +106,6 @@ function getVideoDuration(videoPath) {
 // ─── Step 2: Transcribe ───────────────────────────────────────────────────────
 
 async function transcribeVideo(videoPath) {
-  // Extract audio for Whisper (faster + cheaper than full video)
   const audioPath = videoPath.replace('.mp4', '.mp3');
   await execAsync(
     `ffmpeg -i "${videoPath}" -vn -ar 16000 -ac 1 -b:a 64k "${audioPath}" -y`
@@ -142,20 +134,14 @@ async function transcribeVideo(videoPath) {
     }
   );
 
-  // Clean up audio file
   fs.unlinkSync(audioPath);
-
-  return response.data; // { text, segments: [{id, start, end, text}] }
+  return response.data;
 }
 
 // ─── Step 3: Score + pick clips ───────────────────────────────────────────────
 
 async function scoreAndPickClips(transcript, options = {}) {
-  const {
-    maxClips = 3,
-    minDuration = 30,
-    maxDuration = 90,
-  } = options;
+  const { maxClips = 3, minDuration = 30, maxDuration = 90 } = options;
 
   const segmentText = transcript.segments
     .map((s) => `[${s.start.toFixed(1)}s → ${s.end.toFixed(1)}s] ${s.text}`)
@@ -198,10 +184,7 @@ Respond ONLY with valid JSON in this exact format:
     throw new Error('AI returned invalid clip format');
   }
 
-  // Sort by score descending, take top N
-  return parsed.clips
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxClips);
+  return parsed.clips.sort((a, b) => b.score - a.score).slice(0, maxClips);
 }
 
 // ─── Step 4: Cut + caption ────────────────────────────────────────────────────
@@ -214,12 +197,9 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
     const outputPath = path.join(workDir, `clip_${i + 1}.mp4`);
     const srtPath = path.join(workDir, `clip_${i + 1}.srt`);
 
-    // Build SRT for this clip's time window
     const srt = buildSRT(transcript.segments, clip.start, clip.end);
     fs.writeFileSync(srtPath, srt);
 
-    // FFmpeg: cut + burn captions
-    // Vertical crop (9:16) centered for social media
     await execAsync(
       `ffmpeg -i "${videoPath}" \
         -ss ${clip.start} -to ${clip.end} \
@@ -239,7 +219,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript) {
       start: clip.start,
       end: clip.end,
       duration: clip.end - clip.start,
-      file: outputPath, // local path — replaced by url after R2 upload
+      file: outputPath,
     });
   }
 
@@ -260,7 +240,6 @@ async function uploadClipsToR2(clips, jobId) {
       Key: key,
       Body: fileBuffer,
       ContentType: 'video/mp4',
-      // Files auto-expire after 24h — set lifecycle rule in R2 dashboard
       Metadata: {
         jobId,
         title: clip.title,
@@ -269,7 +248,6 @@ async function uploadClipsToR2(clips, jobId) {
     }));
 
     const url = `${R2_PUBLIC_URL}/${key}`;
-
     uploaded.push({
       index: clip.index,
       title: clip.title,
@@ -278,24 +256,13 @@ async function uploadClipsToR2(clips, jobId) {
       start: clip.start,
       end: clip.end,
       duration: clip.duration,
-      url, // public download URL
+      url,
     });
 
     console.log(`[R2] Uploaded clip ${clip.index}: ${url}`);
   }
 
   return uploaded;
-}
-
-// ─── R2 delete (call when user is done) ──────────────────────────────────────
-
-async function deleteJobFromR2(jobId) {
-  const keys = Array.from({ length: 5 }, (_, i) => `clips/${jobId}/clip_${i + 1}.mp4`);
-  await Promise.allSettled(
-    keys.map((key) =>
-      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }))
-    )
-  );
 }
 
 // ─── SRT builder ──────────────────────────────────────────────────────────────
@@ -329,6 +296,15 @@ function cleanupJob(jobId) {
   if (fs.existsSync(workDir)) {
     fs.rmSync(workDir, { recursive: true, force: true });
   }
+}
+
+async function deleteJobFromR2(jobId) {
+  const keys = Array.from({ length: 5 }, (_, i) => `clips/${jobId}/clip_${i + 1}.mp4`);
+  await Promise.allSettled(
+    keys.map((key) =>
+      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }))
+    )
+  );
 }
 
 module.exports = { processVideo, cleanupJob, deleteJobFromR2 };
