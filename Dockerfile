@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y \
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
   && chmod a+rx /usr/local/bin/yt-dlp
 
-# Tell yt-dlp to use Node.js for signature solving
-ENV YT_DLP_JS_RUNTIME=node
+# Ensure node is on PATH for yt-dlp JS runtime
+RUN ln -sf $(which node) /usr/local/bin/node
 
 WORKDIR /app
 
