@@ -64,10 +64,38 @@ async function processVideo(jobId, url, options, jobs) {
   }
 }
 
+
+// ─── YouTube → Piped conversion ───────────────────────────────────────────────
+
+function convertToPiped(url) {
+  try {
+    const parsed = new URL(url);
+    const isYouTube = ['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com'].includes(parsed.hostname);
+    if (!isYouTube) return url;
+
+    let videoId = null;
+    if (parsed.hostname === 'youtu.be') {
+      videoId = parsed.pathname.slice(1).split('?')[0];
+    } else {
+      videoId = parsed.searchParams.get('v');
+    }
+
+    if (!videoId) return url;
+
+    console.log(`[yt] Converting YouTube URL to Piped: ${videoId}`);
+    return `https://piped.video/watch?v=${videoId}`;
+  } catch {
+    return url;
+  }
+}
+
 // ─── Step 1: Download ─────────────────────────────────────────────────────────
 
 async function downloadVideo(url, workDir) {
   const outputPath = path.join(workDir, 'source.mp4');
+
+  // Convert YouTube URLs to Piped to bypass bot detection
+  const downloadUrl = convertToPiped(url);
 
   const cmd = [
     'yt-dlp',
@@ -75,11 +103,8 @@ async function downloadVideo(url, workDir) {
     '--merge-output-format', 'mp4',
     '--max-filesize', '500m',
     '--no-playlist',
-    '--extractor-args', '"youtube:player_client=web,web_creator"',
-    '--user-agent', '"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"',
-    '--add-header', '"Accept-Language:en-US,en;q=0.9"',
     '--output', `"${outputPath}"`,
-    `"${url}"`,
+    `"${downloadUrl}"`,
   ].join(' ');
 
   await execAsync(cmd, { timeout: 300_000 });
