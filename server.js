@@ -3,14 +3,16 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const { processVideo } = require('./worker');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json());
 
-// In-memory job store (replace with Redis/Supabase for production)
-const jobs = new Map();
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-// Auth middleware
 function requireAuth(req, res, next) {
   const key = req.headers['x-api-key'];
   if (key !== process.env.WORKER_API_KEY) {
@@ -19,46 +21,45 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// POST /job — start a new clip job
+// POST /job
 app.post('/job', requireAuth, async (req, res) => {
   const { url, options = {} } = req.body;
-
-  if (!url) {
-    return res.status(400).json({ error: 'url is required' });
-  }
+  if (!url) return res.status(400).json({ error: 'url is required' });
 
   const jobId = uuidv4();
-
-  jobs.set(jobId, {
+  const job = {
     id: jobId,
     status: 'queued',
     url,
     options,
-    createdAt: Date.now(),
     clips: null,
     error: null,
-  });
+    step: null,
+    created_at: Date.now(),
+  };
 
-  // Run async — don't await
-  processVideo(jobId, url, options, jobs).catch((err) => {
-    const job = jobs.get(jobId);
-    if (job) {
-      job.status = 'failed';
-      job.error = err.message;
-    }
+  await supabase.from('jobs').insert(job);
+
+  processVideo(jobId, url, options, supabase).catch(async (err) => {
+    await supabase.from('jobs').update({ status: 'failed', error: err.message }).eq('id', jobId);
   });
 
   res.json({ jobId, status: 'queued' });
 });
 
-// GET /job/:id — poll job status
-app.get('/job/:id', requireAuth, (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json(job);
+// GET /job/:id
+app.get('/job/:id', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('jobs')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: 'Job not found' });
+  res.json(data);
 });
 
-// POST /frame — extract first frame from video URL
+// POST /frame
 app.post('/frame', requireAuth, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
@@ -69,9 +70,8 @@ app.post('/frame', requireAuth, async (req, res) => {
   try {
     const videoPath = path.join(tmpDir, 'source.mp4');
     const framePath = path.join(tmpDir, 'frame.jpg');
-
-    // Download just first 10 seconds to get the frame fast
     const cookiesPath = path.join(tmpDir, 'cookies.txt');
+
     if (process.env.YOUTUBE_COOKIES) {
       fs.writeFileSync(cookiesPath, process.env.YOUTUBE_COOKIES);
     }
@@ -88,17 +88,14 @@ app.post('/frame', requireAuth, async (req, res) => {
 
     await require('util').promisify(require('child_process').exec)(dlCmd, { timeout: 120_000 });
 
-    // Extract first frame
     await require('util').promisify(require('child_process').exec)(
       `ffmpeg -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
     );
 
-    // Get video dimensions
     const probeResult = await require('util').promisify(require('child_process').exec)(
       `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${videoPath}"`
     );
     const [width, height] = probeResult.stdout.trim().split(',').map(Number);
-
     const frameBase64 = fs.readFileSync(framePath).toString('base64');
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
@@ -111,10 +108,8 @@ app.post('/frame', requireAuth, async (req, res) => {
 
 // GET /health
 app.get('/health', (req, res) => {
-  res.json({ ok: true, jobs: jobs.size });
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Clipper worker listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Clipper worker listening on :${PORT}`));

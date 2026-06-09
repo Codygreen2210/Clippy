@@ -29,38 +29,37 @@ const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
-async function processVideo(jobId, url, options, jobs) {
+async function processVideo(jobId, url, options, supabase) {
   // faceCamBox: { x, y, w, h, video_w, video_h } — set by user in UI
-  const setStatus = (status, extra = {}) => {
-    const job = jobs.get(jobId);
-    Object.assign(job, { status, ...extra });
+  const setStatus = async (status, extra = {}) => {
     console.log(`[${jobId}] ${status}`, extra.step || '');
+    await supabase.from('jobs').update({ status, ...extra }).eq('id', jobId);
   };
 
   const workDir = path.join(TMP, jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    setStatus('running', { step: 'downloading' });
+    await setStatus('running', { step: 'downloading' });
     const videoPath = await downloadVideo(url, workDir);
 
-    setStatus('running', { step: 'transcribing' });
+    await setStatus('running', { step: 'transcribing' });
     const transcript = await transcribeVideo(videoPath);
 
-    setStatus('running', { step: 'scoring' });
+    await setStatus('running', { step: 'scoring' });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
-    setStatus('running', { step: 'cutting' });
+    await setStatus('running', { step: 'cutting' });
     const clips = await cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, options.faceCamBox || null);
 
-    setStatus('running', { step: 'uploading' });
+    await setStatus('running', { step: 'uploading' });
     const uploadedClips = await uploadClipsToR2(clips, jobId);
 
     cleanupJob(jobId);
 
-    setStatus('done', { clips: uploadedClips, step: 'done' });
+    await setStatus('done', { clips: uploadedClips, step: 'done' });
   } catch (err) {
-    setStatus('failed', { error: err.message, step: 'error' });
+    await setStatus('failed', { error: err.message, step: 'error' });
     throw err;
   }
 }
