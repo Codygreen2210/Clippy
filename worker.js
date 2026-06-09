@@ -65,49 +65,49 @@ async function processVideo(jobId, url, options, jobs) {
 }
 
 
-// ─── YouTube → Piped conversion ───────────────────────────────────────────────
-
-function convertToPiped(url) {
-  try {
-    const parsed = new URL(url);
-    const isYouTube = ['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com'].includes(parsed.hostname);
-    if (!isYouTube) return url;
-
-    let videoId = null;
-    if (parsed.hostname === 'youtu.be') {
-      videoId = parsed.pathname.slice(1).split('?')[0];
-    } else {
-      videoId = parsed.searchParams.get('v');
-    }
-
-    if (!videoId) return url;
-
-    console.log(`[yt] Converting YouTube URL to Piped: ${videoId}`);
-    return `https://piped.video/watch?v=${videoId}`;
-  } catch {
-    return url;
-  }
-}
-
 // ─── Step 1: Download ─────────────────────────────────────────────────────────
 
 async function downloadVideo(url, workDir) {
   const outputPath = path.join(workDir, 'source.mp4');
 
-  // Convert YouTube URLs to Piped to bypass bot detection
-  const downloadUrl = convertToPiped(url);
+  // Use cobalt.tools API to get a direct download URL (bypasses YouTube bot detection)
+  const cobaltRes = await axios.post('https://api.cobalt.tools/', {
+    url,
+    videoQuality: '1080',
+    filenameStyle: 'basic',
+  }, {
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+    timeout: 30_000,
+  });
 
-  const cmd = [
-    'yt-dlp',
-    '--format', '"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"',
-    '--merge-output-format', 'mp4',
-    '--max-filesize', '500m',
-    '--no-playlist',
-    '--output', `"${outputPath}"`,
-    `"${downloadUrl}"`,
-  ].join(' ');
+  const { status, url: downloadUrl, stream } = cobaltRes.data;
 
-  await execAsync(cmd, { timeout: 300_000 });
+  if (status === 'error') {
+    throw new Error(`Cobalt error: ${cobaltRes.data?.error?.code || 'unknown'}`);
+  }
+
+  // 'redirect' = direct URL, 'stream' = cobalt-proxied stream
+  const finalUrl = downloadUrl || stream;
+  if (!finalUrl) throw new Error('Cobalt returned no download URL');
+
+  console.log(`[cobalt] Downloading from: ${finalUrl}`);
+
+  // Stream download to disk
+  const writer = fs.createWriteStream(outputPath);
+  const response = await axios.get(finalUrl, {
+    responseType: 'stream',
+    timeout: 300_000,
+    maxContentLength: 500 * 1024 * 1024, // 500MB
+  });
+
+  await new Promise((resolve, reject) => {
+    response.data.pipe(writer);
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
 
   if (!fs.existsSync(outputPath)) {
     throw new Error('Download failed: output file not found');
