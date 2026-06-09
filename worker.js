@@ -78,7 +78,7 @@ async function downloadVideo(url, workDir) {
 
   const cmd = [
     'yt-dlp',
-    '--format', '"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"',
+    '--format', '"bestvideo[height<=1080]+bestaudio/best"',
     '--merge-output-format', 'mp4',
     '--max-filesize', '500m',
     '--no-playlist',
