@@ -2,6 +2,9 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
+const { promisify } = require('util');
+const exec = promisify(require('child_process').exec);
 const { processVideo } = require('./worker');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -68,7 +71,6 @@ app.post('/frame', requireAuth, async (req, res) => {
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    const videoPath = path.join(tmpDir, 'source.mp4');
     const framePath = path.join(tmpDir, 'frame.jpg');
     const cookiesPath = path.join(tmpDir, 'cookies.txt');
 
@@ -76,23 +78,50 @@ app.post('/frame', requireAuth, async (req, res) => {
       fs.writeFileSync(cookiesPath, process.env.YOUTUBE_COOKIES);
     }
 
+    // For a preview frame we only need a few seconds of a small,
+    // single-file format:
+    // - Single pre-muxed format = no video+audio merge, so yt-dlp keeps
+    //   the extension predictable. (The old command merged bestvideo+
+    //   bestaudio WITHOUT --merge-output-format, so yt-dlp wrote
+    //   source.webm/mkv and ffmpeg failed on "source.mp4 not found".)
+    // - --download-sections grabs only the first 3 seconds, so Preview
+    //   stays fast even for hour-long videos.
+    // - Output template uses %(ext)s and we look the file up afterward,
+    //   so any container works regardless.
     const dlCmd = [
       'yt-dlp',
-      '--format', '"bestvideo[height<=1080]+bestaudio/best"',
+      '--format', '"best[height<=480][ext=mp4]/best[height<=480]/best"',
       '--no-playlist',
       '--js-runtimes', 'node',
+      '--download-sections', '"*0:00-0:03"',
+      '--merge-output-format', 'mp4',
       process.env.YOUTUBE_COOKIES ? `--cookies "${cookiesPath}"` : '',
-      '--output', `"${videoPath}"`,
+      '--output', `"${path.join(tmpDir, 'source.%(ext)s')}"`,
       `"${url}"`,
     ].filter(Boolean).join(' ');
 
-    await require('util').promisify(require('child_process').exec)(dlCmd, { timeout: 120_000 });
+    await exec(dlCmd, { timeout: 120_000 });
 
-    await require('util').promisify(require('child_process').exec)(
-      `ffmpeg -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
+    const downloaded = fs.readdirSync(tmpDir).find(
+      (f) => f.startsWith('source.') && !f.endsWith('.part')
     );
+    if (!downloaded) {
+      throw new Error('Frame download produced no video file');
+    }
+    const videoPath = path.join(tmpDir, downloaded);
 
-    const probeResult = await require('util').promisify(require('child_process').exec)(
+    // -ss 1: skip the first second — frame 0 is often black/fade-in
+    await exec(
+      `ffmpeg -ss 1 -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
+    );
+    if (!fs.existsSync(framePath)) {
+      // Clip shorter than 1s — fall back to the very first frame
+      await exec(
+        `ffmpeg -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
+      );
+    }
+
+    const probeResult = await exec(
       `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${videoPath}"`
     );
     const [width, height] = probeResult.stdout.trim().split(',').map(Number);
