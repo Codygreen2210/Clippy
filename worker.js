@@ -109,12 +109,23 @@ function getVideoDuration(videoPath) {
   return parseFloat(result);
 }
 
+function getVideoDims(videoPath) {
+  const result = execSync(
+    `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${videoPath}"`
+  ).toString().trim();
+  const [w, h] = result.split(',').map(Number);
+  if (!w || !h) throw new Error(`Could not read video dimensions: "${result}"`);
+  return { w, h };
+}
+
 // ─── Step 2: Transcribe ───────────────────────────────────────────────────────
 
 async function transcribeVideo(videoPath) {
   const audioPath = videoPath.replace('.mp4', '.mp3');
+  // 32k mono is plenty for speech and keeps a 60-min video (~14MB) under
+  // Whisper's 25MB upload cap. 64k overflows the cap at ~52 minutes.
   await execAsync(
-    `ffmpeg -i "${videoPath}" -vn -ar 16000 -ac 1 -b:a 64k "${audioPath}" -y`
+    `ffmpeg -i "${videoPath}" -vn -ar 16000 -ac 1 -b:a 32k "${audioPath}" -y`
   );
 
   const audioBuffer = fs.readFileSync(audioPath);
@@ -198,6 +209,7 @@ Respond ONLY with valid JSON in this exact format:
 async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, faceCamBox) {
   const results = [];
   const faceCam = (faceCamBox && faceCamBox.w > 0 && faceCamBox.h > 0) ? faceCamBox : null;
+  const dims = getVideoDims(videoPath);
 
   for (let i = 0; i < clipWindows.length; i++) {
     const clip = clipWindows[i];
@@ -211,11 +223,23 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
 
     // Pass 1: Cut and reformat to 9:16 (1080x1920)
     if (faceCam) {
-      const { x, y, w, h } = faceCam;
+      // UI box coords are in preview-frame space (video_w x video_h).
+      // Scale them to the actual source resolution before cropping.
+      const sx = faceCam.video_w ? dims.w / faceCam.video_w : 1;
+      const sy = faceCam.video_h ? dims.h / faceCam.video_h : 1;
+      const even = (n) => Math.max(2, 2 * Math.floor(n / 2));
+      const cw = Math.min(even(faceCam.w * sx), even(dims.w));
+      const ch = Math.min(even(faceCam.h * sy), even(dims.h));
+      const cx = Math.min(Math.max(0, Math.round(faceCam.x * sx)), dims.w - cw);
+      const cy = Math.min(Math.max(0, Math.round(faceCam.y * sy)), dims.h - ch);
+
+      // Top: face cam crop, fill 1080x960 without distortion (scale to cover, center-crop).
+      // Bottom: full frame fill 1080x960 the same way — no hardcoded source resolution,
+      // no aspect squish.
       const vf = [
         `[0:v]split=2[a][b]`,
-        `[a]crop=${w}:${h}:${x}:${y},scale=1080:960[top]`,
-        `[b]scale=1920:1080,crop=1080:1080:420:0,scale=1080:960[bot]`,
+        `[a]crop=${cw}:${ch}:${cx}:${cy},scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top]`,
+        `[b]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bot]`,
         `[top][bot]vstack=inputs=2[v]`,
       ].join(';');
       await execAsync(
@@ -261,6 +285,12 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
 
 // ─── Step 5: Upload to R2 ─────────────────────────────────────────────────────
 
+// S3/R2 metadata headers must be ASCII. GPT-4o titles often contain curly
+// quotes or em-dashes, which makes PutObjectCommand throw and fails the job.
+function asciiSafe(str) {
+  return String(str || '').replace(/[^\x20-\x7E]/g, '').slice(0, 200);
+}
+
 async function uploadClipsToR2(clips, jobId) {
   const uploaded = [];
 
@@ -275,7 +305,7 @@ async function uploadClipsToR2(clips, jobId) {
       ContentType: 'video/mp4',
       Metadata: {
         jobId,
-        title: clip.title,
+        title: asciiSafe(clip.title),
         score: String(clip.score),
       },
     }));
@@ -301,6 +331,9 @@ async function uploadClipsToR2(clips, jobId) {
 // ─── ASS subtitle builder ───────────────────────────────────────────────────────
 
 function buildASS(segments, clipStart, clipEnd) {
+  // Liberation Sans is installed in the Docker image (fonts-liberation) and is
+  // metrically identical to Arial. node:22-slim ships with NO fonts — naming a
+  // font that doesn't exist makes libass silently render nothing.
   const header = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -309,28 +342,32 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,56,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,60,60,80,1
+Style: Default,Liberation Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,60,60,80,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
   const relevant = segments.filter(s => s.end > clipStart && s.start < clipEnd);
-  
+
   const events = relevant.map(seg => {
     const start = Math.max(0, seg.start - clipStart);
     const end = Math.min(clipEnd - clipStart, seg.end - clipStart);
-    return `Dialogue: 0,${toASSTime(start)},${toASSTime(end)},Default,,0,0,0,,${seg.text.trim()}`;
+    // Strip braces (ASS override-tag syntax) and newlines from transcript text
+    const text = seg.text.trim().replace(/[{}]/g, '').replace(/\r?\n/g, ' ');
+    return `Dialogue: 0,${toASSTime(start)},${toASSTime(end)},Default,,0,0,0,,${text}`;
   }).join('\n');
 
   return header + events + '\n';
 }
 
 function toASSTime(seconds) {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const cs = Math.round((seconds % 1) * 100);
+  // Compute in centiseconds so rounding can't produce ".100" (invalid)
+  const totalCs = Math.max(0, Math.round(seconds * 100));
+  const h = Math.floor(totalCs / 360000);
+  const m = Math.floor((totalCs % 360000) / 6000);
+  const s = Math.floor((totalCs % 6000) / 100);
+  const cs = totalCs % 100;
   return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
 }
 
