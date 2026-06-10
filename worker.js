@@ -68,31 +68,43 @@ async function processVideo(jobId, url, options, supabase) {
 // ─── Step 1: Download ─────────────────────────────────────────────────────────
 
 async function downloadVideo(url, workDir) {
-  const outputPath = path.join(workDir, 'source.mp4');
-
   // Write cookies to temp file
   const cookiesPath = path.join(workDir, 'cookies.txt');
   if (process.env.YOUTUBE_COOKIES) {
     fs.writeFileSync(cookiesPath, process.env.YOUTUBE_COOKIES);
   }
 
+  // Output template uses %(ext)s and we look the file up afterward, so the
+  // container yt-dlp picks can never break the path. Note: when a video
+  // exceeds --max-filesize, yt-dlp SKIPS the download and exits 0 — no
+  // error, no file — so we inspect the log when nothing lands on disk.
   const cmd = [
     'yt-dlp',
     '--format', '"bestvideo[height<=1080]+bestaudio/best"',
     '--js-runtimes', 'node',
     '--merge-output-format', 'mp4',
-    '--max-filesize', '500m',
+    '--max-filesize', '1g',
     '--no-playlist',
     process.env.YOUTUBE_COOKIES ? `--cookies "${cookiesPath}"` : '',
-    '--output', `"${outputPath}"`,
+    '--output', `"${path.join(workDir, 'source.%(ext)s')}"`,
     `"${url}"`,
   ].filter(Boolean).join(' ');
 
-  await execAsync(cmd, { timeout: 300_000 });
+  const { stdout, stderr } = await execAsync(cmd, { timeout: 300_000 });
 
-  if (!fs.existsSync(outputPath)) {
-    throw new Error('Download failed: output file not found');
+  const downloaded = fs.readdirSync(workDir).find(
+    (f) => f.startsWith('source.') && !f.endsWith('.part')
+  );
+
+  if (!downloaded) {
+    const log = `${stdout}\n${stderr}`;
+    if (/max-filesize/i.test(log)) {
+      throw new Error('Video exceeds the 1GB download limit — try a shorter or lower-resolution video');
+    }
+    throw new Error(`Download failed: ${log.trim().slice(-300) || 'output file not found'}`);
   }
+
+  const outputPath = path.join(workDir, downloaded);
 
   const duration = getVideoDuration(outputPath);
   if (duration > MAX_VIDEO_DURATION_SECONDS) {
@@ -121,7 +133,9 @@ function getVideoDims(videoPath) {
 // ─── Step 2: Transcribe ───────────────────────────────────────────────────────
 
 async function transcribeVideo(videoPath) {
-  const audioPath = videoPath.replace('.mp4', '.mp3');
+  // Don't derive this from videoPath — the source may not be .mp4, and a
+  // failed .replace() would make ffmpeg write over its own input file.
+  const audioPath = path.join(path.dirname(videoPath), 'audio.mp3');
   // 32k mono is plenty for speech and keeps a 60-min video (~14MB) under
   // Whisper's 25MB upload cap. 64k overflows the cap at ~52 minutes.
   await execAsync(
