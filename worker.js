@@ -196,6 +196,14 @@ RULES:
 - Clips must start and end at natural speech boundaries (not mid-sentence)
 - No overlapping clips
 
+SCORING DIMENSIONS — grade each clip on all four:
+  hook  : Strength of the opening 5 seconds. Does it create immediate curiosity or emotion?
+  flow  : Pacing and narrative coherence. Does it feel complete and satisfying?
+  value : Information density. Does it teach, entertain, or inspire something meaningful?
+  trend : Viral/trend alignment. Does it touch a topic people are actively searching for?
+
+Grade scale: A+, A, A-, B+, B, B-, C+, C, D, F
+
 Respond ONLY with valid JSON in this exact format:
 {
   "clips": [
@@ -204,7 +212,13 @@ Respond ONLY with valid JSON in this exact format:
       "end": 47.2,
       "title": "Short punchy title for this clip",
       "hook": "First sentence that will appear as hook",
-      "score": 95
+      "score": 95,
+      "breakdown": {
+        "hook":  { "grade": "A",  "reason": "One sentence explaining this grade." },
+        "flow":  { "grade": "A-", "reason": "One sentence explaining this grade." },
+        "value": { "grade": "A",  "reason": "One sentence explaining this grade." },
+        "trend": { "grade": "B+", "reason": "One sentence explaining this grade." }
+      }
     }
   ]
 }`;
