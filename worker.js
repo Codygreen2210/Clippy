@@ -193,142 +193,56 @@ Respond ONLY with valid JSON in this exact format:
   return parsed.clips.sort((a, b) => b.score - a.score).slice(0, maxClips);
 }
 
-// ─── Step 4: Cut + caption (with optional face cam split) ───────────────────
-
-// Legacy Vision detection — replaced by manual box selection in UI
-async function detectFaceCam_DISABLED(videoPath) {
-  // Extract first frame
-  const framePath = videoPath.replace('.mp4', '_frame.jpg');
-  await execAsync(
-    `ffmpeg -i "${videoPath}" -vframes 1 -q:v 2 "${framePath}" -y`
-  );
-
-  const imageBuffer = fs.readFileSync(framePath);
-  const base64Image = imageBuffer.toString('base64');
-  fs.unlinkSync(framePath);
-
-  // Ask Claude Vision to detect the face cam
-  const response = await axios.post(
-    'https://api.anthropic.com/v1/messages',
-    {
-      model: 'claude-opus-4-5',
-      max_tokens: 256,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: base64Image }
-          },
-          {
-            type: 'text',
-            text: `This is a frame from a gaming livestream. There is a face cam (webcam of the streamer) overlaid on the gameplay footage.
-
-Identify the face cam rectangle and return ONLY a JSON object with these fields:
-{
-  "x": <left edge in pixels>,
-  "y": <top edge in pixels>,
-  "w": <width in pixels>,
-  "h": <height in pixels>,
-  "video_w": <total video width in pixels>,
-  "video_h": <total video height in pixels>
-}
-
-No explanation, just the JSON.`
-          }
-        ]
-      }]
-    },
-    {
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      timeout: 30_000,
-    }
-  );
-
-  try {
-    const text = response.data.content[0].text.trim();
-    const clean = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-  } catch {
-    console.log('[facecam] Detection failed, using default layout');
-    return null;
-  }
-}
-
 // ─── Step 4: Cut + caption ────────────────────────────────────────────────────
 
 async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, faceCamBox) {
   const results = [];
-
-  // Use manually selected face cam box from UI, or fall back to simple crop
   const faceCam = (faceCamBox && faceCamBox.w > 0 && faceCamBox.h > 0) ? faceCamBox : null;
-  if (faceCam) {
-    console.log('[facecam] Using manual box:', JSON.stringify(faceCam));
-  } else {
-    console.log('[facecam] No face cam box — using center crop');
-  }
 
   for (let i = 0; i < clipWindows.length; i++) {
     const clip = clipWindows[i];
+    const rawPath = path.join(workDir, `raw_${i + 1}.mp4`);
     const outputPath = path.join(workDir, `clip_${i + 1}.mp4`);
-    const srtPath = path.join(workDir, `clip_${i + 1}.srt`);
+    const assPath = `/tmp/c${i}.ass`;
 
-    const srt = buildSRT(transcript.segments, clip.start, clip.end);
-    fs.writeFileSync(srtPath, srt);
+    // Build ASS subtitle file — no path escaping issues, supports rich styling
+    const ass = buildASS(transcript.segments, clip.start, clip.end);
+    fs.writeFileSync(assPath, ass);
 
-    let vf;
-
-    if (faceCam && faceCam.w > 0 && faceCam.h > 0 && faceCam.x >= 0 && faceCam.y >= 0) {
-      const { x, y, w, h, video_w, video_h } = faceCam;
-
-      // Face cam: crop to detected rectangle, scale to 1080x960
-      const faceCrop = `crop=${w}:${h}:${x}:${y},scale=1080:960`;
-
-      // Gameplay: use everything outside face cam — crop center of gameplay area
-      // Take the full frame, scale to 1080x960, use as background
-      const gameplayCrop = `scale=1080:960`;
-
-      // Caption style for bottom half
-      const captionStyle = `Fontname=Arial,Fontsize=16,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2,MarginV=20`;
-      const safeSrtSplit = `/tmp/s${i}.srt`;
-      fs.copyFileSync(srtPath, safeSrtSplit);
-
-      vf = [
-        `[0:v]split=2[gameplay_in][face_in]`,
-        `[gameplay_in]${gameplayCrop}[gameplay]`,
-        `[face_in]${faceCrop}[facecam]`,
-        `[facecam][gameplay]vstack=inputs=2[stacked]`,
-        `[stacked]subtitles='${safeSrtSplit}':force_style='${captionStyle}'[out]`,
+    // Pass 1: Cut and reformat to 9:16 (1080x1920)
+    if (faceCam) {
+      const { x, y, w, h } = faceCam;
+      const vf = [
+        `[0:v]split=2[a][b]`,
+        `[a]crop=${w}:${h}:${x}:${y},scale=1080:960[top]`,
+        `[b]scale=1920:1080,crop=1080:1080:420:0,scale=1080:960[bot]`,
+        `[top][bot]vstack=inputs=2[v]`,
       ].join(';');
-
       await execAsync(
-        `ffmpeg -i "${videoPath}" \
-          -ss ${clip.start} -to ${clip.end} \
-          -filter_complex "${vf}" \
-          -map "[out]" \
-          -c:v libx264 -preset fast -crf 23 \
-          -c:a aac -b:a 128k \
-          -movflags +faststart \
-          "${outputPath}" -y`,
+        `ffmpeg -ss ${clip.start} -to ${clip.end} -i "${videoPath}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     } else {
-      // Fallback: simple center crop to 9:16
+      // Blur background fill — no cropping, full frame visible
+      const vf = [
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[fg]`,
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]`,
+        `[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
+      ].join(';');
       await execAsync(
-        `ffmpeg -i "${videoPath}" \
-          -ss ${clip.start} -to ${clip.end} \
-          -vf "crop=ih*9/16:ih,scale=1080:1920,subtitles='${srtPath.replace(/:/g, '\\:').replace(/'/g, "\\'")}':force_style='Fontname=Arial,Fontsize=18,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1,Alignment=2'" \
-          -c:v libx264 -preset fast -crf 23 \
-          -c:a aac -b:a 128k \
-          -movflags +faststart \
-          "${outputPath}" -y`,
+        `ffmpeg -ss ${clip.start} -to ${clip.end} -i "${videoPath}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     }
+
+    // Pass 2: Burn ASS subtitles
+    await execAsync(
+      `ffmpeg -i "${rawPath}" -vf "ass='${assPath}'" -c:v libx264 -preset fast -crf 23 -c:a copy -movflags +faststart "${outputPath}" -y`,
+      { timeout: 180_000 }
+    );
+
+    fs.unlinkSync(rawPath);
+    fs.unlinkSync(assPath);
 
     results.push({
       index: i + 1,
@@ -384,28 +298,40 @@ async function uploadClipsToR2(clips, jobId) {
   return uploaded;
 }
 
-// ─── SRT builder ──────────────────────────────────────────────────────────────
+// ─── ASS subtitle builder ───────────────────────────────────────────────────────
 
-function buildSRT(segments, clipStart, clipEnd) {
-  const relevant = segments.filter(
-    (s) => s.end > clipStart && s.start < clipEnd
-  );
+function buildASS(segments, clipStart, clipEnd) {
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
 
-  return relevant
-    .map((seg, i) => {
-      const start = Math.max(0, seg.start - clipStart);
-      const end = Math.min(clipEnd - clipStart, seg.end - clipStart);
-      return `${i + 1}\n${formatSRTTime(start)} --> ${formatSRTTime(end)}\n${seg.text.trim()}\n`;
-    })
-    .join('\n');
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,56,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,60,60,80,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const relevant = segments.filter(s => s.end > clipStart && s.start < clipEnd);
+  
+  const events = relevant.map(seg => {
+    const start = Math.max(0, seg.start - clipStart);
+    const end = Math.min(clipEnd - clipStart, seg.end - clipStart);
+    return `Dialogue: 0,${toASSTime(start)},${toASSTime(end)},Default,,0,0,0,,${seg.text.trim()}`;
+  }).join('\n');
+
+  return header + events + '\n';
 }
 
-function formatSRTTime(seconds) {
+function toASSTime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
-  const ms = Math.round((seconds % 1) * 1000);
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+  const cs = Math.round((seconds % 1) * 100);
+  return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
