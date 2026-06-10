@@ -5,7 +5,7 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
-const { processVideo } = require('./worker');
+const { processVideo, extendClip } = require('./worker');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -60,6 +60,23 @@ app.get('/job/:id', requireAuth, async (req, res) => {
 
   if (error || !data) return res.status(404).json({ error: 'Job not found' });
   res.json(data);
+});
+
+// POST /extend — re-render one clip with an adjusted window
+app.post('/extend', requireAuth, async (req, res) => {
+  const { jobId, clipIndex, start, end } = req.body;
+  if (!jobId || typeof clipIndex !== 'number' || typeof start !== 'number' || typeof end !== 'number') {
+    return res.status(400).json({ error: 'jobId, clipIndex, start, end are required' });
+  }
+  if (end - start < 5) {
+    return res.status(400).json({ error: 'Clip must be at least 5 seconds' });
+  }
+
+  extendClip(jobId, clipIndex, start, end, supabase).catch((err) => {
+    console.error(`[extend ${jobId}/${clipIndex}]`, err.message);
+  });
+
+  res.json({ ok: true });
 });
 
 // POST /frame

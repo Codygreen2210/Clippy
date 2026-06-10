@@ -46,7 +46,9 @@ async function processVideo(jobId, url, options, supabase) {
     await setStatus('running', { step: 'transcribing' });
     const transcript = await transcribeVideo(videoPath);
 
-    await setStatus('running', { step: 'scoring' });
+    // Persist slim segments so clips can be re-rendered later (extend/trim)
+    const segments = transcript.segments.map(s => ({ start: s.start, end: s.end, text: s.text }));
+    await setStatus('running', { step: 'scoring', segments });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
     await setStatus('running', { step: 'cutting' });
@@ -261,9 +263,11 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
         { timeout: 180_000 }
       );
     } else {
-      // Blur background fill — no cropping, full frame visible
+      // Blur background fill — fg must NOT be padded: pad fills with opaque
+      // black and completely covers the blurred layer underneath (the
+      // black-bars bug). Scale to fit, let overlay center it on the blur.
       const vf = [
-        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[fg]`,
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]`,
         `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]`,
         `[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
       ].join(';');
@@ -305,11 +309,11 @@ function asciiSafe(str) {
   return String(str || '').replace(/[^\x20-\x7E]/g, '').slice(0, 200);
 }
 
-async function uploadClipsToR2(clips, jobId) {
+async function uploadClipsToR2(clips, jobId, version = '') {
   const uploaded = [];
 
   for (const clip of clips) {
-    const key = `clips/${jobId}/clip_${clip.index}.mp4`;
+    const key = `clips/${jobId}/clip_${clip.index}${version ? `_${version}` : ''}.mp4`;
     const fileBuffer = fs.readFileSync(clip.file);
 
     await r2.send(new PutObjectCommand({
@@ -403,4 +407,54 @@ async function deleteJobFromR2(jobId) {
   );
 }
 
-module.exports = { processVideo, cleanupJob, deleteJobFromR2 };
+// ─── Extend / trim a single clip ──────────────────────────────────────────────
+
+const MAX_CLIP_SECONDS = 180;
+
+async function extendClip(jobId, clipIndex, newStart, newEnd, supabase) {
+  const { data: job, error } = await supabase
+    .from('jobs').select('*').eq('id', jobId).single();
+  if (error || !job) throw new Error('Job not found');
+  if (!job.segments) throw new Error('This job predates clip adjustment — re-run the video');
+
+  const clips = job.clips || [];
+  const idx = clips.findIndex(c => c.index === clipIndex);
+  if (idx === -1) throw new Error('Clip not found');
+
+  const setClip = async (patch) => {
+    clips[idx] = { ...clips[idx], ...patch };
+    await supabase.from('jobs').update({ clips }).eq('id', jobId);
+  };
+
+  await setClip({ extending: true, extend_error: null });
+
+  const workDir = path.join(TMP, `${jobId}-ext-${Date.now()}`);
+  fs.mkdirSync(workDir, { recursive: true });
+
+  try {
+    const videoPath = await downloadVideo(job.url, workDir);
+    const duration = getVideoDuration(videoPath);
+
+    let start = Math.max(0, newStart);
+    let end = Math.min(duration, newEnd);
+    if (end - start < 5) throw new Error('Clip must be at least 5 seconds');
+    if (end - start > MAX_CLIP_SECONDS) end = start + MAX_CLIP_SECONDS;
+
+    const win = { ...clips[idx], start, end };
+    const faceCamBox = (job.options && job.options.faceCamBox) || null;
+    const cut = await cutAndCaptionClips(videoPath, [win], workDir, { segments: job.segments }, faceCamBox);
+    // cutAndCaptionClips assigns index by array position — restore the real one
+    cut[0].index = clipIndex;
+
+    const [uploaded] = await uploadClipsToR2(cut, jobId, `v${Date.now()}`);
+
+    await setClip({ ...uploaded, extending: false, extend_error: null });
+  } catch (err) {
+    await setClip({ extending: false, extend_error: err.message });
+    throw err;
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+module.exports = { processVideo, cleanupJob, deleteJobFromR2, extendClip };
