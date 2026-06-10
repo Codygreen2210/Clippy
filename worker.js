@@ -410,8 +410,10 @@ async function cutAndCaptionClips(sections, clipWindows, workDir, transcript, fa
   const results = await Promise.all(clipWindows.map(async (clip, i) => {
     const section    = sections[i];
     // The section file starts at section.offset; adjust seek times accordingly.
-    const ssTime     = Math.max(0, clip.start - section.offset);
-    const toTime     = clip.end - section.offset;
+    // Clamp to 3 decimal places — JS float imprecision (e.g. 43.8999999999998)
+    // doesn't cause ffmpeg errors but is ugly in logs and can confuse some demuxers.
+    const ssTime = parseFloat(Math.max(0, clip.start - section.offset).toFixed(3));
+    const toTime = parseFloat((clip.end   - section.offset).toFixed(3));
     const rawPath    = path.join(workDir, `raw_${section.index}.mp4`);
     const outputPath = path.join(workDir, `clip_${section.index}.mp4`);
     // Job-scoped ASS path so parallel jobs never collide in /tmp
@@ -444,7 +446,7 @@ async function cutAndCaptionClips(sections, clipWindows, workDir, transcript, fa
         `[top][bot]vstack=inputs=2[v]`,
       ].join(';');
       await execAsync(
-        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
+        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     } else {
@@ -457,7 +459,7 @@ async function cutAndCaptionClips(sections, clipWindows, workDir, transcript, fa
         `[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
       ].join(';');
       await execAsync(
-        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
+        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a? -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     }
