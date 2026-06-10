@@ -46,9 +46,13 @@ async function processVideo(jobId, url, options, supabase) {
     await setStatus('running', { step: 'transcribing' });
     const transcript = await transcribeVideo(videoPath);
 
-    // Persist slim segments so clips can be re-rendered later (extend/trim)
-    const segments = transcript.segments.map(s => ({ start: s.start, end: s.end, text: s.text }));
-    await setStatus('running', { step: 'scoring', segments });
+    // Persist slim transcript data so clips can be re-rendered later.
+    // Store { segments, words } so extend path can rebuild karaoke subs.
+    const savedTranscript = {
+      segments: transcript.segments.map(s => ({ start: s.start, end: s.end, text: s.text })),
+      words: (transcript.words || []).map(w => ({ word: w.word, start: w.start, end: w.end })),
+    };
+    await setStatus('running', { step: 'scoring', segments: savedTranscript });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
     await setStatus('running', { step: 'cutting' });
@@ -153,6 +157,7 @@ async function transcribeVideo(videoPath) {
   formData.append('model', 'whisper-1');
   formData.append('response_format', 'verbose_json');
   formData.append('timestamp_granularities[]', 'segment');
+  formData.append('timestamp_granularities[]', 'word');
 
   const response = await axios.post(
     'https://api.openai.com/v1/audio/transcriptions',
@@ -234,7 +239,8 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
     const assPath = `/tmp/c${i}.ass`;
 
     // Build ASS subtitle file — no path escaping issues, supports rich styling
-    const ass = buildASS(transcript.segments, clip.start, clip.end);
+    const layoutMode = faceCam ? 'facecam' : 'blur';
+    const ass = buildASS(transcript, clip.start, clip.end, layoutMode, dims.w, dims.h);
     fs.writeFileSync(assPath, ass);
 
     // Pass 1: Cut and reformat to 9:16 (1080x1920)
@@ -348,11 +354,39 @@ async function uploadClipsToR2(clips, jobId, version = '') {
 
 // ─── ASS subtitle builder ───────────────────────────────────────────────────────
 
-function buildASS(segments, clipStart, clipEnd) {
-  // Liberation Sans is installed in the Docker image (fonts-liberation) and is
-  // metrically identical to Arial. node:22-slim ships with NO fonts — naming a
-  // font that doesn't exist makes libass silently render nothing.
-  const header = `[Script Info]
+// ─── ASS subtitle builder ─────────────────────────────────────────────────────
+// Word-level karaoke: one Dialogue event per word showing the full display
+// line, current word highlighted yellow, past/future words white.
+// Falls back to segment-level subs when word timestamps are unavailable.
+
+function buildASS(transcript, clipStart, clipEnd, layout = 'blur', srcW = 1920, srcH = 1080) {
+  const words    = transcript.words    || [];
+  const segments = transcript.segments || [];
+  const marginV  = calcSubMarginV(layout, srcW, srcH);
+  const header   = makeASSHeader(marginV);
+  return words.length > 0
+    ? header + buildKaraokeEvents(words, clipStart, clipEnd)
+    : header + buildSegmentEvents(segments, clipStart, clipEnd);
+}
+
+// For blur mode, place subs 60px inside the video content area bottom edge,
+// not floating in the blur zone below it.
+function calcSubMarginV(layout, srcW, srcH) {
+  if (layout === 'facecam') return 80;
+  const srcAR    = srcW / srcH;
+  const canvasAR = 1080 / 1920;      // 0.5625
+  if (srcAR <= canvasAR) return 80;  // portrait/near-portrait fills full height
+  // Landscape: content is width-limited at 1080px
+  const contentH      = Math.round(1080 / srcAR);
+  const contentBottom = Math.round((1920 + contentH) / 2); // px from top
+  return Math.max(80, 1920 - contentBottom + 60);
+}
+
+const YELLOW = '&H0000FFFF&'; // ASS ABGR: opaque yellow (R=255,G=255,B=0)
+const WHITE  = '&H00FFFFFF&'; // opaque white
+
+function makeASSHeader(marginV) {
+  return `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -360,23 +394,71 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Liberation Sans,56,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,60,60,80,1
+Style: Default,Liberation Sans,64,${WHITE},${YELLOW},&H00000000,&HCC000000,-1,0,0,0,100,100,0,0,1,4,0,2,80,80,${marginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
+}
 
-  const relevant = segments.filter(s => s.end > clipStart && s.start < clipEnd);
+function cleanWord(w) {
+  return String(w || '').replace(/[{}]/g, '').replace(/\r?\n/g, ' ').trim();
+}
 
-  const events = relevant.map(seg => {
-    const start = Math.max(0, seg.start - clipStart);
-    const end = Math.min(clipEnd - clipStart, seg.end - clipStart);
-    // Strip braces (ASS override-tag syntax) and newlines from transcript text
-    const text = seg.text.trim().replace(/[{}]/g, '').replace(/\r?\n/g, ' ');
-    return `Dialogue: 0,${toASSTime(start)},${toASSTime(end)},Default,,0,0,0,,${text}`;
-  }).join('\n');
+// Group words into display lines (max 4 words / ~22 chars), then for each
+// word emit a Dialogue event with the line text and that word highlighted.
+function buildKaraokeEvents(rawWords, clipStart, clipEnd) {
+  const words = rawWords
+    .filter(w => w.end > clipStart && w.start < clipEnd)
+    .map(w => ({
+      word:  cleanWord(w.word),
+      start: Math.max(0, w.start - clipStart),
+      end:   Math.min(clipEnd - clipStart, w.end - clipStart),
+    }))
+    .filter(w => w.word.length > 0 && w.end > w.start);
 
-  return header + events + '\n';
+  if (words.length === 0) return '';
+
+  const lines = [];
+  let cur = [];
+  for (const w of words) {
+    cur.push(w);
+    if (cur.length >= 4 || cur.map(x => x.word).join(' ').length > 22) {
+      lines.push(cur); cur = [];
+    }
+  }
+  if (cur.length > 0) lines.push(cur);
+
+  const events = [];
+  for (const line of lines) {
+    // Close micro-gaps between consecutive words within the line
+    for (let i = 0; i < line.length - 1; i++) {
+      if (line[i + 1].start > line[i].end) {
+        line[i] = { ...line[i], end: line[i + 1].start };
+      }
+    }
+    for (let i = 0; i < line.length; i++) {
+      const lineText = line.map((w, j) =>
+        j === i ? `{\\c${YELLOW}}${w.word}{\\c${WHITE}}` : w.word
+      ).join(' ');
+      events.push(
+        `Dialogue: 0,${toASSTime(line[i].start)},${toASSTime(line[i].end)},Default,,0,0,0,,{\\c${WHITE}}${lineText}`
+      );
+    }
+  }
+  return events.join('\n') + '\n';
+}
+
+// Fallback: whole segment as a single line (no word timestamps)
+function buildSegmentEvents(segments, clipStart, clipEnd) {
+  return segments
+    .filter(s => s.end > clipStart && s.start < clipEnd)
+    .map(seg => {
+      const s = Math.max(0, seg.start - clipStart);
+      const e = Math.min(clipEnd - clipStart, seg.end - clipStart);
+      return `Dialogue: 0,${toASSTime(s)},${toASSTime(e)},Default,,0,0,0,,${cleanWord(seg.text)}`;
+    })
+    .join('\n') + '\n';
 }
 
 function toASSTime(seconds) {
@@ -416,6 +498,10 @@ async function extendClip(jobId, clipIndex, newStart, newEnd, supabase) {
     .from('jobs').select('*').eq('id', jobId).single();
   if (error || !job) throw new Error('Job not found');
   if (!job.segments) throw new Error('This job predates clip adjustment — re-run the video');
+  // Normalise: old jobs stored segments array; new jobs store { segments, words }.
+  const extTranscript = (job.segments && job.segments.words)
+    ? job.segments
+    : { segments: Array.isArray(job.segments) ? job.segments : [], words: [] };
 
   const clips = job.clips || [];
   const idx = clips.findIndex(c => c.index === clipIndex);
@@ -442,7 +528,7 @@ async function extendClip(jobId, clipIndex, newStart, newEnd, supabase) {
 
     const win = { ...clips[idx], start, end };
     const faceCamBox = (job.options && job.options.faceCamBox) || null;
-    const cut = await cutAndCaptionClips(videoPath, [win], workDir, { segments: job.segments }, faceCamBox);
+    const cut = await cutAndCaptionClips(videoPath, [win], workDir, extTranscript, faceCamBox);
     // cutAndCaptionClips assigns index by array position — restore the real one
     cut[0].index = clipIndex;
 
