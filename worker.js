@@ -292,6 +292,17 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
     fs.unlinkSync(rawPath);
     fs.unlinkSync(assPath);
 
+    // Extract thumbnail from the rendered 9:16 output at the midpoint.
+    // Scale to 540px wide (half res) to keep R2 upload small.
+    const thumbPath = path.join(workDir, `thumb_${i + 1}.jpg`);
+    const midSec = (clip.end - clip.start) * 0.45; // slightly before midpoint
+    try {
+      await execAsync(
+        `ffmpeg -ss ${midSec} -i "${outputPath}" -vframes 1 -q:v 3 -vf "scale=540:-1" "${thumbPath}" -y`,
+        { timeout: 15_000 }
+      );
+    } catch (_) { /* non-fatal — clip still usable without thumbnail */ }
+
     results.push({
       index: i + 1,
       title: clip.title,
@@ -301,6 +312,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
       end: clip.end,
       duration: clip.end - clip.start,
       file: outputPath,
+      thumbFile: fs.existsSync(thumbPath) ? thumbPath : null,
     });
   }
 
@@ -335,6 +347,20 @@ async function uploadClipsToR2(clips, jobId, version = '') {
     }));
 
     const url = `${R2_PUBLIC_URL}/${key}`;
+
+    // Upload thumbnail if the cut step produced one
+    let thumbnail_url = null;
+    if (clip.thumbFile && fs.existsSync(clip.thumbFile)) {
+      const thumbKey = `clips/${jobId}/clip_${clip.index}${version ? `_${version}` : ''}_thumb.jpg`;
+      await r2.send(new PutObjectCommand({
+        Bucket: R2_BUCKET, Key: thumbKey,
+        Body: fs.readFileSync(clip.thumbFile),
+        ContentType: 'image/jpeg',
+        Metadata: { jobId },
+      }));
+      thumbnail_url = `${R2_PUBLIC_URL}/${thumbKey}`;
+    }
+
     uploaded.push({
       index: clip.index,
       title: clip.title,
@@ -344,6 +370,7 @@ async function uploadClipsToR2(clips, jobId, version = '') {
       end: clip.end,
       duration: clip.duration,
       url,
+      thumbnail_url,
     });
 
     console.log(`[R2] Uploaded clip ${clip.index}: ${url}`);
@@ -481,11 +508,12 @@ function cleanupJob(jobId) {
 }
 
 async function deleteJobFromR2(jobId) {
-  const keys = Array.from({ length: 5 }, (_, i) => `clips/${jobId}/clip_${i + 1}.mp4`);
+  const keys = Array.from({ length: 5 }, (_, i) => [
+    `clips/${jobId}/clip_${i + 1}.mp4`,
+    `clips/${jobId}/clip_${i + 1}_thumb.jpg`,
+  ]).flat();
   await Promise.allSettled(
-    keys.map((key) =>
-      r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }))
-    )
+    keys.map((key) => r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key })))
   );
 }
 
