@@ -59,10 +59,18 @@ async function processVideo(jobId, url, options, supabase) {
     await setStatus('running', { step: 'scoring', segments: savedTranscript });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
-    // ── Pass 2: download only the exact time windows we need, in parallel.
-    // 3 × 60-second clips ≈ 150–300 MB vs downloading the full video.
+    // ── Pass 2: single 720p download — one request, no DASH section-seeking.
+    // --download-sections on YouTube DASH is unreliable (seeks through the
+    // segment index while merging streams live) and triggers rate-limiting
+    // when run 3× in parallel from the same IP. One 720p download is
+    // ~200–400 MB for a 30-min video vs 1+ GB for 1080p, and finishes
+    // in 15–30 s on Railway's network.
     await setStatus('running', { step: 'downloading' });
-    const sections = await downloadClipSections(url, clipWindows, workDir, cookiesPath);
+    const videoPath = await downloadVideoForRender(url, workDir, cookiesPath);
+
+    // Wrap in the sections shape cutAndCaptionClips expects (offset=0:
+    // the full video starts at t=0 so clip.start/end are already correct).
+    const sections = clipWindows.map((_, i) => ({ index: i + 1, path: videoPath, offset: 0 }));
 
     await setStatus('running', { step: 'cutting' });
     const clips = await cutAndCaptionClips(sections, clipWindows, workDir, transcript, options.faceCamBox || null);
@@ -136,6 +144,47 @@ function writeCookies(workDir) {
   return p;
 }
 
+// Single 720p video download for rendering. One reliable request is far
+// better than 3 parallel --download-sections calls which hit YouTube DASH
+// rate limits and fail ~50% of the time on shared Railway IPs.
+async function downloadVideoForRender(url, workDir, cookiesPath) {
+  const cmd = [
+    'yt-dlp',
+    '--format', '"bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"',
+    '--merge-output-format', 'mp4',
+    '--no-playlist',
+    '--js-runtimes', 'node',
+    '--concurrent-fragments', '4',
+    '--retries', '3',
+    '--fragment-retries', '3',
+    '--max-filesize', '1g',
+    cookiesPath ? `--cookies "${cookiesPath}"` : '',
+    '--output', `"${path.join(workDir, 'video.%(ext)s')}"`,
+    `"${url}"`,
+  ].filter(Boolean).join(' ');
+
+  const { stdout, stderr } = await execAsync(cmd, { timeout: 300_000 });
+
+  const downloaded = fs.readdirSync(workDir).find(
+    (f) => f.startsWith('video.') && !f.endsWith('.part')
+  );
+  if (!downloaded) {
+    const log = `${stdout}
+${stderr}`;
+    if (/max-filesize/i.test(log)) {
+      throw new Error('Video exceeds the 1 GB size limit — try a shorter video');
+    }
+    throw new Error(`Video download failed: ${log.trim().slice(-300)}`);
+  }
+
+  const videoPath = path.join(workDir, downloaded);
+  const duration  = getVideoDuration(videoPath);
+  if (duration > MAX_VIDEO_DURATION_SECONDS) {
+    throw new Error(`Video too long: ${Math.round(duration / 60)} min (max 60)`);
+  }
+  return videoPath;
+}
+
 // Audio-only download for transcription — much faster than a full video download.
 async function downloadAudioOnly(url, workDir, cookiesPath) {
   const cmd = [
@@ -144,6 +193,8 @@ async function downloadAudioOnly(url, workDir, cookiesPath) {
     '--no-playlist',
     '--js-runtimes', 'node',
     '--concurrent-fragments', '4',
+    '--retries', '3',
+    '--fragment-retries', '3',
     cookiesPath ? `--cookies "${cookiesPath}"` : '',
     '--output', `"${path.join(workDir, 'audio.%(ext)s')}"`,
     `"${url}"`,
@@ -175,6 +226,8 @@ async function downloadClipSection(url, clipStart, clipEnd, workDir, index, cook
     '--no-playlist',
     '--js-runtimes', 'node',
     '--concurrent-fragments', '4',
+    '--retries', '3',
+    '--fragment-retries', '3',
     '--download-sections', `"*${bufStart}-${bufEnd}"`,
     cookiesPath ? `--cookies "${cookiesPath}"` : '',
     '--output', `"${outBase}.%(ext)s"`,
@@ -261,27 +314,52 @@ async function transcribeVideo(videoPath) {
 
 async function scoreAndPickClips(transcript, options = {}) {
   const { maxClips = 3, minDuration = 30, maxDuration = 90 } = options;
+  const isLongForm = minDuration >= 120; // 2+ minutes = long-form mode
 
   const segmentText = transcript.segments
     .map((s) => `[${s.start.toFixed(1)}s → ${s.end.toFixed(1)}s] ${s.text}`)
     .join('\n');
 
-  const prompt = `You are an expert short-form video editor. Analyze this transcript and identify the ${maxClips} best clip windows for viral short-form content (TikTok, Reels, Shorts).
+  // The scoring criteria and persona differ significantly between short-form
+  // (viral hooks, punchy) and long-form (complete narratives, digest).
+  const persona = isLongForm
+    ? 'You are an expert podcast and long-form video editor.'
+    : 'You are an expert short-form video editor.';
+
+  const formatDesc = isLongForm
+    ? `long-form highlight clips (YouTube, podcasts, LinkedIn) — each a self-contained segment a viewer could watch on its own`
+    : `viral short-form clips (TikTok, Reels, Shorts)`;
+
+  const priorityCriteria = isLongForm
+    ? `- Complete topic or argument with a clear beginning, middle, and end
+- Full interview answers, explanations, or stories — never cut mid-thought
+- Segments that stand alone without needing external context
+- Natural breathing room at start and end (don't start mid-sentence)
+- Aim to space clips across different parts of the video so together they cover the full content`
+    : `- Strong hook in the first 3–5 seconds that creates immediate curiosity
+- Surprising facts, emotional peaks, or high-value insight
+- Complete thought that lands cleanly without trailing off`;
+
+  const hookDimDesc = isLongForm
+    ? 'Quality of the opening sentence — does it draw the viewer in for a longer watch?'
+    : 'Strength of the opening 5 seconds. Does it create immediate curiosity or emotion?';
+
+  const prompt = `${persona} Analyze this transcript and identify the ${maxClips} best clip windows for ${formatDesc}.
 
 TRANSCRIPT WITH TIMESTAMPS:
 ${segmentText}
 
 RULES:
 - Each clip must be ${minDuration}–${maxDuration} seconds long
-- Prioritize: hooks, surprising facts, emotional moments, clear value delivery, complete thoughts
+- ${priorityCriteria}
 - Clips must start and end at natural speech boundaries (not mid-sentence)
 - No overlapping clips
 
 SCORING DIMENSIONS — grade each clip on all four:
-  hook  : Strength of the opening 5 seconds. Does it create immediate curiosity or emotion?
+  hook  : ${hookDimDesc}
   flow  : Pacing and narrative coherence. Does it feel complete and satisfying?
   value : Information density. Does it teach, entertain, or inspire something meaningful?
-  trend : Viral/trend alignment. Does it touch a topic people are actively searching for?
+  trend : ${isLongForm ? 'Shareability and relevance. Would people send this to a friend?' : 'Viral/trend alignment. Does it touch a topic people are actively searching for?'}
 
 Grade scale: A+, A, A-, B+, B, B-, C+, C, D, F
 
@@ -291,7 +369,7 @@ Respond ONLY with valid JSON in this exact format:
     {
       "start": 12.5,
       "end": 47.2,
-      "title": "Short punchy title for this clip",
+      "title": "${isLongForm ? 'Descriptive title for this segment' : 'Short punchy title for this clip'}",
       "hook": "First sentence that will appear as hook",
       "score": 95,
       "breakdown": {
@@ -620,7 +698,7 @@ async function deleteJobFromR2(jobId) {
 
 // ─── Extend / trim a single clip ──────────────────────────────────────────────
 
-const MAX_CLIP_SECONDS = 180;
+const MAX_CLIP_SECONDS = 420; // 7-minute hard ceiling; long-form presets top out at 6 min
 
 async function extendClip(jobId, clipIndex, newStart, newEnd, supabase) {
   const { data: job, error } = await supabase
