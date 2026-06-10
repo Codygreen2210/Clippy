@@ -40,14 +40,18 @@ async function processVideo(jobId, url, options, supabase) {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
+    // ── Pass 1: audio only — much smaller than the full video, and all
+    // Whisper needs is audio. A 1-hour video at 128kbps ≈ 55 MB vs ~1 GB
+    // for 1080p video. We don't touch the video until we know which clips
+    // to pull.
     await setStatus('running', { step: 'downloading' });
-    const videoPath = await downloadVideo(url, workDir);
+    const cookiesPath = writeCookies(workDir);
+    const audioFilePath = await downloadAudioOnly(url, workDir, cookiesPath);
 
     await setStatus('running', { step: 'transcribing' });
-    const transcript = await transcribeVideo(videoPath);
+    const transcript = await transcribeVideo(audioFilePath);
 
     // Persist slim transcript data so clips can be re-rendered later.
-    // Store { segments, words } so extend path can rebuild karaoke subs.
     const savedTranscript = {
       segments: transcript.segments.map(s => ({ start: s.start, end: s.end, text: s.text })),
       words: (transcript.words || []).map(w => ({ word: w.word, start: w.start, end: w.end })),
@@ -55,8 +59,13 @@ async function processVideo(jobId, url, options, supabase) {
     await setStatus('running', { step: 'scoring', segments: savedTranscript });
     const clipWindows = await scoreAndPickClips(transcript, options);
 
+    // ── Pass 2: download only the exact time windows we need, in parallel.
+    // 3 × 60-second clips ≈ 150–300 MB vs downloading the full video.
+    await setStatus('running', { step: 'downloading' });
+    const sections = await downloadClipSections(url, clipWindows, workDir, cookiesPath);
+
     await setStatus('running', { step: 'cutting' });
-    const clips = await cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, options.faceCamBox || null);
+    const clips = await cutAndCaptionClips(sections, clipWindows, workDir, transcript, options.faceCamBox || null);
 
     await setStatus('running', { step: 'uploading' });
     const uploadedClips = await uploadClipsToR2(clips, jobId);
@@ -118,6 +127,78 @@ async function downloadVideo(url, workDir) {
   }
 
   return outputPath;
+}
+
+function writeCookies(workDir) {
+  if (!process.env.YOUTUBE_COOKIES) return null;
+  const p = path.join(workDir, 'cookies.txt');
+  fs.writeFileSync(p, process.env.YOUTUBE_COOKIES);
+  return p;
+}
+
+// Audio-only download for transcription — much faster than a full video download.
+async function downloadAudioOnly(url, workDir, cookiesPath) {
+  const cmd = [
+    'yt-dlp',
+    '--format', '"bestaudio/best"',
+    '--no-playlist',
+    '--js-runtimes', 'node',
+    '--concurrent-fragments', '4',
+    cookiesPath ? `--cookies "${cookiesPath}"` : '',
+    '--output', `"${path.join(workDir, 'audio.%(ext)s')}"`,
+    `"${url}"`,
+  ].filter(Boolean).join(' ');
+
+  const { stdout, stderr } = await execAsync(cmd, { timeout: 180_000 });
+
+  const downloaded = fs.readdirSync(workDir).find(
+    (f) => f.startsWith('audio.') && !f.endsWith('.part')
+  );
+  if (!downloaded) {
+    throw new Error(`Audio download failed: ${(stdout + stderr).trim().slice(-300)}`);
+  }
+  return path.join(workDir, downloaded);
+}
+
+// Download a specific time window of a video. We buffer 4 s on each side so
+// keyframe alignment never clips the first/last frame; ffmpeg does the precise
+// trim later. Returns { index, path, offset } where offset = actual file start.
+async function downloadClipSection(url, clipStart, clipEnd, workDir, index, cookiesPath) {
+  const bufStart = Math.max(0, clipStart - 4);
+  const bufEnd   = clipEnd + 4;
+  const outBase  = path.join(workDir, `section_${index}`);
+
+  const cmd = [
+    'yt-dlp',
+    '--format', '"bestvideo[height<=1080]+bestaudio/best"',
+    '--merge-output-format', 'mp4',
+    '--no-playlist',
+    '--js-runtimes', 'node',
+    '--concurrent-fragments', '4',
+    '--download-sections', `"*${bufStart}-${bufEnd}"`,
+    cookiesPath ? `--cookies "${cookiesPath}"` : '',
+    '--output', `"${outBase}.%(ext)s"`,
+    `"${url}"`,
+  ].filter(Boolean).join(' ');
+
+  const { stdout, stderr } = await execAsync(cmd, { timeout: 180_000 });
+
+  const downloaded = fs.readdirSync(workDir).find(
+    (f) => f.startsWith(`section_${index}.`) && !f.endsWith('.part')
+  );
+  if (!downloaded) {
+    throw new Error(`Section ${index} download failed: ${(stdout + stderr).trim().slice(-200)}`);
+  }
+  return { index, path: path.join(workDir, downloaded), offset: bufStart };
+}
+
+// Download all clip sections in parallel.
+async function downloadClipSections(url, clipWindows, workDir, cookiesPath) {
+  return Promise.all(
+    clipWindows.map((clip, i) =>
+      downloadClipSection(url, clip.start, clip.end, workDir, i + 1, cookiesPath)
+    )
+  );
 }
 
 function getVideoDuration(videoPath) {
@@ -241,16 +322,22 @@ Respond ONLY with valid JSON in this exact format:
 
 // ─── Step 4: Cut + caption ────────────────────────────────────────────────────
 
-async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, faceCamBox) {
-  const results = [];
+// sections: [{ index, path, offset }, ...]
+// Processes all clips in parallel — each renders independently on its own
+// section file, so there is no shared state to serialize.
+async function cutAndCaptionClips(sections, clipWindows, workDir, transcript, faceCamBox) {
   const faceCam = (faceCamBox && faceCamBox.w > 0 && faceCamBox.h > 0) ? faceCamBox : null;
-  const dims = getVideoDims(videoPath);
+  const dims = getVideoDims(sections[0].path);
 
-  for (let i = 0; i < clipWindows.length; i++) {
-    const clip = clipWindows[i];
-    const rawPath = path.join(workDir, `raw_${i + 1}.mp4`);
-    const outputPath = path.join(workDir, `clip_${i + 1}.mp4`);
-    const assPath = `/tmp/c${i}.ass`;
+  const results = await Promise.all(clipWindows.map(async (clip, i) => {
+    const section    = sections[i];
+    // The section file starts at section.offset; adjust seek times accordingly.
+    const ssTime     = Math.max(0, clip.start - section.offset);
+    const toTime     = clip.end - section.offset;
+    const rawPath    = path.join(workDir, `raw_${section.index}.mp4`);
+    const outputPath = path.join(workDir, `clip_${section.index}.mp4`);
+    // Job-scoped ASS path so parallel jobs never collide in /tmp
+    const assPath    = path.join(workDir, `sub_${section.index}.ass`);
 
     // Build ASS subtitle file — no path escaping issues, supports rich styling
     const layoutMode = faceCam ? 'facecam' : 'blur';
@@ -279,7 +366,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
         `[top][bot]vstack=inputs=2[v]`,
       ].join(';');
       await execAsync(
-        `ffmpeg -ss ${clip.start} -to ${clip.end} -i "${videoPath}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
+        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     } else {
@@ -292,7 +379,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
         `[bg][fg]overlay=(W-w)/2:(H-h)/2[v]`,
       ].join(';');
       await execAsync(
-        `ffmpeg -ss ${clip.start} -to ${clip.end} -i "${videoPath}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
+        `ffmpeg -ss ${ssTime} -to ${toTime} -i "${section.path}" -filter_complex "${vf}" -map "[v]" -map 0:a -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${rawPath}" -y`,
         { timeout: 180_000 }
       );
     }
@@ -308,7 +395,7 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
 
     // Extract thumbnail from the rendered 9:16 output at the midpoint.
     // Scale to 540px wide (half res) to keep R2 upload small.
-    const thumbPath = path.join(workDir, `thumb_${i + 1}.jpg`);
+    const thumbPath = path.join(workDir, `thumb_${section.index}.jpg`);
     const midSec = (clip.end - clip.start) * 0.45; // slightly before midpoint
     try {
       await execAsync(
@@ -317,8 +404,8 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
       );
     } catch (_) { /* non-fatal — clip still usable without thumbnail */ }
 
-    results.push({
-      index: i + 1,
+    return {
+      index: section.index,
       title: clip.title,
       hook: clip.hook,
       score: clip.score,
@@ -327,8 +414,8 @@ async function cutAndCaptionClips(videoPath, clipWindows, workDir, transcript, f
       duration: clip.end - clip.start,
       file: outputPath,
       thumbFile: fs.existsSync(thumbPath) ? thumbPath : null,
-    });
-  }
+    };
+  }));
 
   return results;
 }
@@ -560,17 +647,20 @@ async function extendClip(jobId, clipIndex, newStart, newEnd, supabase) {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    const videoPath = await downloadVideo(job.url, workDir);
-    const duration = getVideoDuration(videoPath);
+    const cookiesPath = writeCookies(workDir);
 
     let start = Math.max(0, newStart);
-    let end = Math.min(duration, newEnd);
+    let end   = newEnd;
     if (end - start < 5) throw new Error('Clip must be at least 5 seconds');
     if (end - start > MAX_CLIP_SECONDS) end = start + MAX_CLIP_SECONDS;
 
+    // Section download: only fetch the adjusted window, not the entire video.
+    // This is why extend re-renders are much faster than the original job.
+    const section = await downloadClipSection(job.url, start, end, workDir, clipIndex, cookiesPath);
+
     const win = { ...clips[idx], start, end };
     const faceCamBox = (job.options && job.options.faceCamBox) || null;
-    const cut = await cutAndCaptionClips(videoPath, [win], workDir, extTranscript, faceCamBox);
+    const cut = await cutAndCaptionClips([section], [win], workDir, extTranscript, faceCamBox);
     // cutAndCaptionClips assigns index by array position — restore the real one
     cut[0].index = clipIndex;
 
